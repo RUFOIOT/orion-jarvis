@@ -815,28 +815,30 @@ function toggleMic() {
     setState('listening');
     document.dispatchEvent(new CustomEvent('orion:mic-toggle', { detail: { active: true } }));
 
-    // Simulate listening for 2.5s then process
+    // Simular escucha por 2.5s → al parar, enviar texto capturado al agente
     setTimeout(() => {
       setState('processing');
       isProcessing = true;
 
-      // Show transcript
-      const resp = RESPONSES[responseIndex % RESPONSES.length];
-      transcriptText.textContent = resp.text;
-      transcript.classList.add('visible');
-      targetBright = resp.bright;
+      // Texto capturado por Web Speech o placeholder
+      const capturedText = transcriptText.textContent.trim() ||
+        RESPONSES[responseIndex % RESPONSES.length].text;
       responseIndex++;
 
-      setTimeout(() => {
-        isListening = false;
+      // Enviar al agente ORION (backend real)
+      sendToOrion(capturedText).finally(() => {
+        isListening  = false;
         isProcessing = false;
         setState('idle');
-      }, 2500);
+      });
     }, 2500);
   } else {
+    // Al detener manualmente: enviar lo que haya en transcript
+    const captured = transcriptText.textContent.trim();
     isListening = false;
     setState('idle');
     document.dispatchEvent(new CustomEvent('orion:mic-toggle', { detail: { active: false } }));
+    if (captured) sendToOrion(captured);
   }
 }
 
@@ -852,6 +854,188 @@ function toggleCard(id) {
   const el = document.getElementById(id);
   if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
+
+// ═══════════════════════════════════════════
+//  ORION BACKEND BRIDGE — WebSocket + API
+// ═══════════════════════════════════════════
+
+const ORION_API  = 'http://localhost:3001';
+const ORION_WS   = 'ws://localhost:3001/ws';
+let   orionWS    = null;   // instancia WebSocket activa
+let   wsRetryTmr = null;   // timer de reconexión
+let   alertCount = 3;      // badge de alertas
+
+/**
+ * Envía un mensaje de texto al agente ORION vía REST.
+ * Actualiza el orbe mientras procesa.
+ */
+async function sendToOrion(text) {
+  if (!text || !text.trim()) return;
+  console.log('[ORION] sendToOrion →', text.slice(0, 80));
+
+  setState('processing');
+  transcript.classList.add('visible');
+  transcriptText.textContent = '⭐ Procesando...';
+  targetBright = 0.6;
+
+  try {
+    const res = await fetch(`${ORION_API}/api/message`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ message: text }),
+    });
+    const data = await res.json();
+    if (data.ok && data.reply) {
+      transcriptText.textContent = data.reply;
+      targetBright = 0.9;
+      transcript.classList.add('visible');
+    }
+  } catch (err) {
+    console.warn('[ORION] sendToOrion fetch error:', err.message);
+    // Si el backend no está disponible, mostramos respuesta local
+    transcriptText.textContent = '⭐ Backend ORION offline. Revisa node server.js';
+    targetBright = 0.3;
+  } finally {
+    setState('idle');
+  }
+}
+
+/**
+ * Crea y posiciona una card dinámica en el DOM.
+ * type: 'lead' | 'alert' | 'response'
+ */
+function createCard(type, data) {
+  const existing = document.getElementById(`dyn-card-${data.id || Date.now()}`);
+  if (existing) existing.remove(); // evitar duplicados
+
+  const card = document.createElement('div');
+  card.className = 'response-card';
+  card.id = `dyn-card-${data.id || Date.now()}`;
+
+  // Posición aleatoria evitando la barra de actividad (derecha) y el header
+  const maxX = Math.max(50, window.innerWidth - 600);
+  const maxY = Math.max(120, window.innerHeight - 320);
+  const x = 30 + Math.floor(Math.random() * Math.min(maxX, 300));
+  const y = 120 + Math.floor(Math.random() * Math.min(maxY - 120, 200));
+  card.style.cssText = `left:${x}px; top:${y}px; animation: card-float 4s ease-in-out ${Math.random().toFixed(1)}s infinite, card-enter 0.4s cubic-bezier(0.16,1,0.3,1) both;`;
+
+  if (type === 'lead') {
+    const prob = data.prob ? `${Math.round(data.prob * 100)}%` : '?';
+    const ticket = data.ticket ? `$${data.ticket.toLocaleString()}` : '';
+    card.innerHTML = `
+      <button class="card-close" onclick="this.parentElement.remove()">✕</button>
+      <div class="card-accent">🎯 Lead en vivo</div>
+      <div class="card-title">${data.name || 'Lead'}</div>
+      <div class="card-metric">${data.score || '?'}/10</div>
+      <div class="card-body">${data.product || ''}<br/>Prob. cierre: ${prob} · Ticket: ${ticket}</div>
+    `;
+  } else if (type === 'alert') {
+    card.style.borderTopColor = '#ef4444';
+    card.innerHTML = `
+      <button class="card-close" onclick="this.parentElement.remove()">✕</button>
+      <div class="card-accent" style="color:#ef4444">⚠️ Alerta</div>
+      <div class="card-title">${data.title || 'Nueva alerta'}</div>
+      <div class="card-body">${data.message || ''}</div>
+    `;
+  } else {
+    card.innerHTML = `
+      <button class="card-close" onclick="this.parentElement.remove()">✕</button>
+      <div class="card-accent">⭐ ORION</div>
+      <div class="card-title">${data.title || 'Respuesta'}</div>
+      <div class="card-body">${data.message || data.text || ''}</div>
+    `;
+  }
+
+  document.body.appendChild(card);
+  // Auto-eliminar después de 12 segundos
+  setTimeout(() => card.remove(), 12000);
+  return card;
+}
+
+/**
+ * Incrementa el badge de alertas en el header.
+ */
+function incrementAlertBadge() {
+  alertCount++;
+  const badge = document.querySelector('.icon-btn .badge');
+  if (badge) badge.textContent = alertCount;
+}
+
+/**
+ * Conecta al servidor WebSocket de ORION con reconexión automática.
+ */
+function connectOrionWS() {
+  if (orionWS && orionWS.readyState === WebSocket.OPEN) return;
+
+  console.log('[ORION] Conectando WebSocket...');
+  orionWS = new WebSocket(ORION_WS);
+
+  orionWS.onopen = () => {
+    console.log('[ORION] WS conectado ✅');
+    if (wsRetryTmr) { clearTimeout(wsRetryTmr); wsRetryTmr = null; }
+    // Avisar al servidor que la UI está lista
+    orionWS.send(JSON.stringify({ event: 'ui:ready', data: {} }));
+  };
+
+  orionWS.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    const { event, data } = msg;
+
+    switch (event) {
+
+      // Respuesta del agente: actualizar transcript + orbe
+      case 'orion:response':
+        if (data?.text) {
+          transcriptText.textContent = data.text;
+          transcript.classList.add('visible');
+          if (data.voiceBright != null) targetBright = data.voiceBright;
+          // Ocultar transcript después de 6s
+          setTimeout(() => transcript.classList.remove('visible'), 6000);
+        }
+        break;
+
+      // Cambio de estado del agente
+      case 'orion:state':
+        if (data?.state && !isListening) setState(data.state);
+        break;
+
+      // Lead dinámico: crear card
+      case 'orion:lead':
+        if (data) createCard('lead', data);
+        break;
+
+      // Alerta: badge + card
+      case 'orion:alert':
+        incrementAlertBadge();
+        if (data) createCard('alert', data);
+        break;
+
+      // Cron disparado
+      case 'orion:cron_fired':
+        console.log('[ORION] Cron fired:', data);
+        createCard('response', { title: '⏰ Cron ejecutado', message: data?.command || '' });
+        break;
+
+      default:
+        console.log('[ORION] WS evento desconocido:', event);
+    }
+  };
+
+  orionWS.onclose = () => {
+    console.warn('[ORION] WS desconectado. Reconectando en 3s...');
+    orionWS = null;
+    wsRetryTmr = setTimeout(connectOrionWS, 3000);
+  };
+
+  orionWS.onerror = (err) => {
+    console.warn('[ORION] WS error (backend offline?):', err.type || err);
+    // onclose se dispara después, que maneja la reconexión
+  };
+}
+
+// Iniciar conexión WS al cargar
+connectOrionWS();
 
 // ── Keyboard shortcut ──
 document.addEventListener('keydown', e => {
@@ -879,6 +1063,12 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
   };
 
   try { recognition.start(); } catch(err) {}
+
+  // Al obtener resultado final, enviar al agente
+  recognition.onend = () => {
+    // Se reinicia automáticamente para escucha continua de wake word
+    try { recognition.start(); } catch(_) {}
+  };
 }
 </script>
 </body>
